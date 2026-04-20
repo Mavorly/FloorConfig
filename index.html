@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FloorConfig — Flooring Layout Planner</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">▦</span>
+      <h1>FloorConfig</h1>
+      <span class="subtitle">Flooring layout planner</span>
+    </div>
+    <div class="toolbar">
+      <button id="btn-undo" title="Undo (Ctrl+Z)">↶ Undo</button>
+      <button id="btn-redo" title="Redo (Ctrl+Y)">↷ Redo</button>
+      <span class="sep"></span>
+      <button id="btn-generate" class="primary">⚙ Generate Layout</button>
+      <button id="btn-clear-layout">Clear Layout</button>
+      <span class="sep"></span>
+      <label class="toggle">
+        <input type="checkbox" id="toggle-manual" />
+        <span>Manual edit mode</span>
+      </label>
+      <span class="sep"></span>
+      <label class="toggle">
+        <input type="checkbox" id="toggle-grid" checked />
+        <span>Grid</span>
+      </label>
+      <label class="toggle">
+        <input type="checkbox" id="toggle-labels" checked />
+        <span>Labels</span>
+      </label>
+    </div>
+    <div class="status" id="status">Ready.</div>
+  </header>
+
+  <main class="layout">
+    <!-- LEFT: Room shape editor -->
+    <aside class="panel left">
+      <section>
+        <h2>Room</h2>
+        <div class="row">
+          <label>Units
+            <select id="units">
+              <option value="in">inches</option>
+              <option value="ft">feet</option>
+              <option value="cm">cm</option>
+              <option value="mm">mm</option>
+            </select>
+          </label>
+        </div>
+        <div class="row two">
+          <label>Width <input id="room-w" type="number" min="1" step="0.125" value="144" /></label>
+          <label>Length <input id="room-l" type="number" min="1" step="0.125" value="192" /></label>
+        </div>
+        <p class="hint">Width = horizontal, Length = vertical. Use Add/Subtract regions for bump-outs and jut-ins (closets, chimneys, islands, etc.).</p>
+      </section>
+
+      <section>
+        <h2>Jut-ins & Bump-outs</h2>
+        <div class="region-list" id="region-list"></div>
+        <div class="row">
+          <button id="btn-add-sub" title="Remove a rectangular area from the room">＋ Jut-in (subtract)</button>
+          <button id="btn-add-add" title="Add a rectangular area to the room">＋ Bump-out (add)</button>
+        </div>
+        <p class="hint">Tip: origin (0,0) is the top-left corner of the base rectangle.</p>
+      </section>
+
+      <section>
+        <h2>Summary</h2>
+        <ul class="stats" id="room-stats"></ul>
+      </section>
+    </aside>
+
+    <!-- CENTER: Canvas -->
+    <section class="canvas-wrap">
+      <div class="canvas-header">
+        <span id="cursor-readout">—</span>
+        <span class="spacer"></span>
+        <button id="btn-zoom-out">−</button>
+        <button id="btn-zoom-reset">Fit</button>
+        <button id="btn-zoom-in">+</button>
+      </div>
+      <div class="canvas-host" id="canvas-host">
+        <svg id="svg" xmlns="http://www.w3.org/2000/svg"></svg>
+      </div>
+      <div class="canvas-footer">
+        <div id="selection-info">Nothing selected.</div>
+      </div>
+    </section>
+
+    <!-- RIGHT: Inventory, layout, profiles, export -->
+    <aside class="panel right">
+      <section>
+        <h2>Board inventory</h2>
+        <div class="row">
+          <label class="btn-like">
+            <input id="csv-input" type="file" accept=".csv,text/csv" hidden />
+            📂 Import CSV
+          </label>
+          <button id="btn-csv-template">Download template</button>
+        </div>
+        <p class="hint">CSV columns: <code>width,length,qty,name</code> — <code>qty</code> and <code>name</code> optional.</p>
+        <div class="inventory" id="inventory"></div>
+        <div class="row">
+          <button id="btn-add-board">＋ Add board</button>
+          <button id="btn-clear-boards">Clear all</button>
+        </div>
+        <ul class="stats" id="inv-stats"></ul>
+      </section>
+
+      <section>
+        <h2>Layout options</h2>
+        <div class="row">
+          <label>Pattern
+            <select id="pattern">
+              <option value="running">Running bond (1/3 offset)</option>
+              <option value="half">Half offset (brick)</option>
+              <option value="random">Random stagger</option>
+              <option value="sequential">Sequential (no stagger)</option>
+              <option value="herringbone">Herringbone (simple)</option>
+            </select>
+          </label>
+        </div>
+        <div class="row">
+          <label>Orientation
+            <select id="orientation">
+              <option value="horizontal">Horizontal (boards run along width)</option>
+              <option value="vertical">Vertical (boards run along length)</option>
+            </select>
+          </label>
+        </div>
+        <div class="row two">
+          <label>Row width
+            <select id="row-width"></select>
+          </label>
+          <label>Min cut
+            <input id="min-cut" type="number" min="0" step="0.25" value="6" />
+          </label>
+        </div>
+        <div class="row two">
+          <label>Stagger
+            <input id="stagger" type="number" min="0" step="0.25" value="16" />
+          </label>
+          <label>Seed (random)
+            <input id="seed" type="number" step="1" value="1" />
+          </label>
+        </div>
+        <div class="row">
+          <label class="toggle">
+            <input type="checkbox" id="reuse-cutoffs" checked />
+            <span>Reuse cut-off pieces</span>
+          </label>
+        </div>
+      </section>
+
+      <section>
+        <h2>Profiles</h2>
+        <div class="row two">
+          <input id="profile-name" type="text" placeholder="Profile name" />
+          <button id="btn-save-profile" class="primary">Save</button>
+        </div>
+        <div class="row two">
+          <select id="profile-select"></select>
+          <button id="btn-load-profile">Load</button>
+        </div>
+        <div class="row two">
+          <button id="btn-delete-profile">Delete</button>
+          <button id="btn-duplicate-profile">Duplicate</button>
+        </div>
+      </section>
+
+      <section>
+        <h2>Export</h2>
+        <div class="row two">
+          <button id="btn-export-svg">SVG</button>
+          <button id="btn-export-png">PNG</button>
+        </div>
+        <div class="row two">
+          <button id="btn-export-cutlist">Cut list CSV</button>
+          <button id="btn-export-json">Profile JSON</button>
+        </div>
+        <div class="row">
+          <label class="btn-like">
+            <input id="json-input" type="file" accept=".json,application/json" hidden />
+            📂 Import profile JSON
+          </label>
+        </div>
+        <div class="row">
+          <button id="btn-print">🖨 Print view</button>
+        </div>
+      </section>
+
+      <section>
+        <h2>Live stats</h2>
+        <ul class="stats" id="layout-stats"></ul>
+      </section>
+    </aside>
+  </main>
+
+  <!-- Floating selection editor (shown when a board is selected) -->
+  <div id="board-editor" class="floating hidden">
+    <div class="head">
+      <strong>Board</strong>
+      <button id="be-close" aria-label="Close">✕</button>
+    </div>
+    <div class="body">
+      <div class="row two">
+        <label>X <input id="be-x" type="number" step="0.125" /></label>
+        <label>Y <input id="be-y" type="number" step="0.125" /></label>
+      </div>
+      <div class="row two">
+        <label>W <input id="be-w" type="number" step="0.125" /></label>
+        <label>L <input id="be-l" type="number" step="0.125" /></label>
+      </div>
+      <div class="row two">
+        <button id="be-rotate">↻ Rotate 90°</button>
+        <button id="be-delete">🗑 Delete</button>
+      </div>
+      <div class="row">
+        <label>Replace with
+          <select id="be-replace"></select>
+        </label>
+      </div>
+    </div>
+  </div>
+
+  <template id="tpl-region-row">
+    <div class="region">
+      <select class="r-type">
+        <option value="sub">Subtract</option>
+        <option value="add">Add</option>
+      </select>
+      <input class="r-x" type="number" step="0.125" placeholder="x" />
+      <input class="r-y" type="number" step="0.125" placeholder="y" />
+      <input class="r-w" type="number" step="0.125" placeholder="w" />
+      <input class="r-h" type="number" step="0.125" placeholder="h" />
+      <button class="r-del" title="Remove">✕</button>
+    </div>
+  </template>
+
+  <template id="tpl-inv-row">
+    <div class="inv-row">
+      <input class="i-name" type="text" placeholder="name" />
+      <input class="i-w" type="number" step="0.125" placeholder="width" />
+      <input class="i-l" type="number" step="0.125" placeholder="length" />
+      <input class="i-q" type="number" step="1" placeholder="qty" />
+      <span class="i-used">0</span>
+      <button class="i-del" title="Remove">✕</button>
+    </div>
+  </template>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
