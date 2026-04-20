@@ -24,27 +24,28 @@ function cloneInv(inventory) {
   return inventory.map(b => ({ ...b, remaining: b.qty }));
 }
 
-// Pick the length of the next board, preferring longer boards with remaining
-// quantity. Returns the source board record.
-function pickBoard(inv, maxLen, rng) {
-  // Eligible: remaining > 0 AND length <= maxLen + small slack
-  // (we'll cut anything longer to fit).
+// Pick the next board to place. Goal: minimize cuts.
+//   - If any board fits in the remaining space uncut, take the LONGEST such
+//     board (fills the most space with no cut at all).
+//   - Otherwise, we must cut. Pick the longest board overall so the leftover
+//     becomes the biggest, most reusable cut-off.
+//   - For small leader/offset pieces, pass {preferShort:true} so a huge plank
+//     isn't chopped up just to start a staggered row.
+// Ties broken by highest remaining quantity (spread wear across stock).
+function pickBoard(inv, maxLen, { preferShort = false } = {}) {
   const eligible = inv.filter(b => b.remaining > 0);
   if (!eligible.length) return null;
 
-  // Prefer exact/close fit first; otherwise longest available (we cut it).
-  const withinLen = eligible.filter(b => b.length <= maxLen + EPS);
-  const pool = withinLen.length ? withinLen : eligible;
-
-  // Weighted random by remaining qty for variety.
-  let total = 0;
-  for (const b of pool) total += b.remaining;
-  let r = rng() * total;
-  for (const b of pool) {
-    r -= b.remaining;
-    if (r <= 0) return b;
+  const fits = eligible.filter(b => b.length <= maxLen + EPS);
+  if (fits.length) {
+    const cmp = preferShort
+      ? (a, b) => (a.length - b.length) || (b.remaining - a.remaining)
+      : (a, b) => (b.length - a.length) || (b.remaining - a.remaining);
+    return fits.slice().sort(cmp)[0];
   }
-  return pool[pool.length - 1];
+  // Nothing fits uncut — take the longest so the cut-off is maximally reusable.
+  return eligible.slice().sort((a, b) =>
+    (b.length - a.length) || (b.remaining - a.remaining))[0];
 }
 
 function rowStartOffset(rowIndex, pattern, primaryLen, stagger, rng) {
@@ -103,21 +104,46 @@ function generateHorizontal(room, inventory, opts) {
       if (x1 === segments[0][0] && startOffset > 0) {
         const offsetLen = Math.min(startOffset, x2 - x1);
         if (offsetLen >= opts.minCut) {
-          // Place a short leading piece (cut from a longer board) so the
-          // first visible board in the next row aligns with the stagger.
-          const src = pickBoard(inv, Infinity, rng);
-          if (src) {
-            const useLen = Math.min(offsetLen, src.length);
-            boards.push(makeBoard(src, x, y1, src.width, useLen, false,
-              { from: 0, to: useLen, origLen: src.length }));
-            consumeBoard(src);
-            if (opts.reuseCutoffs && src.length - useLen >= opts.minCut) {
-              cutoffs.push({ srcId: src.id, name: src.name, width: src.width, length: src.length - useLen });
+          // Prefer a cut-off for the leader so we don't chop a long plank
+          // just to start the stagger.
+          let usedCutoff = false;
+          if (opts.reuseCutoffs) {
+            const idx = pickCutoff(cutoffs, rowW, offsetLen, opts.minCut);
+            if (idx >= 0) {
+              const c = cutoffs.splice(idx, 1)[0];
+              let useLen = c.length;
+              let cutInfo = null;
+              if (useLen > offsetLen + EPS) {
+                cutInfo = { from: 0, to: offsetLen, origLen: c.length };
+                if (c.length - offsetLen >= opts.minCut) {
+                  cutoffs.push({ srcId: c.srcId, name: c.name, width: c.width, length: c.length - offsetLen });
+                }
+                useLen = offsetLen;
+              }
+              boards.push({
+                id: uid('pb'), srcId: c.srcId, name: c.name,
+                x, y: y1, w: c.width, l: useLen,
+                rotated: false, cut: cutInfo, reused: true,
+              });
+              x += useLen;
+              usedCutoff = true;
             }
-            x += useLen;
-            // If the offset required more than one board (unusual), skip.
-          } else {
-            x += offsetLen;
+          }
+          if (!usedCutoff) {
+            // Use the shortest available board so long stock stays intact.
+            const src = pickBoard(inv, Infinity, { preferShort: true });
+            if (src) {
+              const useLen = Math.min(offsetLen, src.length);
+              boards.push(makeBoard(src, x, y1, src.width, useLen, false,
+                useLen < src.length - EPS ? { from: 0, to: useLen, origLen: src.length } : null));
+              consumeBoard(src);
+              if (opts.reuseCutoffs && src.length - useLen >= opts.minCut) {
+                cutoffs.push({ srcId: src.id, name: src.name, width: src.width, length: src.length - useLen });
+              }
+              x += useLen;
+            } else {
+              x += offsetLen;
+            }
           }
         } else {
           // too small to stagger — just shift; the next board starts here.
@@ -159,7 +185,7 @@ function generateHorizontal(room, inventory, opts) {
         }
         if (placed) continue;
 
-        const src = pickBoard(inv, spaceLeft, rng) || pickBoard(inv, Infinity, rng);
+        const src = pickBoard(inv, spaceLeft) || pickBoard(inv, Infinity);
         if (!src) {
           // Out of boards; stop filling this segment.
           boards.push({
@@ -226,17 +252,42 @@ function generateVertical(room, inventory, opts) {
       if (y1 === segments[0][0] && startOffset > 0) {
         const offsetLen = Math.min(startOffset, y2 - y1);
         if (offsetLen >= opts.minCut) {
-          const src = pickBoard(inv, Infinity, rng);
-          if (src) {
-            const useLen = Math.min(offsetLen, src.length);
-            boards.push(makeBoard(src, x1, y, src.width, useLen, true,
-              { from: 0, to: useLen, origLen: src.length }));
-            consumeBoard(src);
-            if (opts.reuseCutoffs && src.length - useLen >= opts.minCut) {
-              cutoffs.push({ srcId: src.id, name: src.name, width: src.width, length: src.length - useLen });
+          let usedCutoff = false;
+          if (opts.reuseCutoffs) {
+            const idx = pickCutoff(cutoffs, colW, offsetLen, opts.minCut);
+            if (idx >= 0) {
+              const c = cutoffs.splice(idx, 1)[0];
+              let useLen = c.length;
+              let cutInfo = null;
+              if (useLen > offsetLen + EPS) {
+                cutInfo = { from: 0, to: offsetLen, origLen: c.length };
+                if (c.length - offsetLen >= opts.minCut) {
+                  cutoffs.push({ srcId: c.srcId, name: c.name, width: c.width, length: c.length - offsetLen });
+                }
+                useLen = offsetLen;
+              }
+              boards.push({
+                id: uid('pb'), srcId: c.srcId, name: c.name,
+                x: x1, y, w: c.width, l: useLen,
+                rotated: true, cut: cutInfo, reused: true,
+              });
+              y += useLen;
+              usedCutoff = true;
             }
-            y += useLen;
-          } else { y += offsetLen; }
+          }
+          if (!usedCutoff) {
+            const src = pickBoard(inv, Infinity, { preferShort: true });
+            if (src) {
+              const useLen = Math.min(offsetLen, src.length);
+              boards.push(makeBoard(src, x1, y, src.width, useLen, true,
+                useLen < src.length - EPS ? { from: 0, to: useLen, origLen: src.length } : null));
+              consumeBoard(src);
+              if (opts.reuseCutoffs && src.length - useLen >= opts.minCut) {
+                cutoffs.push({ srcId: src.id, name: src.name, width: src.width, length: src.length - useLen });
+              }
+              y += useLen;
+            } else { y += offsetLen; }
+          }
         } else { y += offsetLen; }
       }
 
@@ -271,7 +322,7 @@ function generateVertical(room, inventory, opts) {
         }
         if (placed) continue;
 
-        const src = pickBoard(inv, spaceLeft, rng) || pickBoard(inv, Infinity, rng);
+        const src = pickBoard(inv, spaceLeft) || pickBoard(inv, Infinity);
         if (!src) {
           boards.push({
             id: uid('gap'), gap: true,
