@@ -9,40 +9,46 @@
 <body>
   <header class="topbar">
     <div class="brand">
+      <button class="tray-toggle" id="btn-tray-left" aria-label="Open room panel">☰</button>
       <span class="logo">▦</span>
       <h1>FloorConfig</h1>
       <span class="subtitle">Flooring layout planner</span>
     </div>
     <div class="toolbar">
-      <button id="btn-undo" title="Undo (Ctrl+Z)">↶ Undo</button>
-      <button id="btn-redo" title="Redo (Ctrl+Y)">↷ Redo</button>
+      <button id="btn-undo" title="Undo (Ctrl+Z)">↶</button>
+      <button id="btn-redo" title="Redo (Ctrl+Y)">↷</button>
       <span class="sep"></span>
-      <button id="btn-generate" class="primary">⚙ Generate Layout</button>
-      <button id="btn-clear-layout">Clear Layout</button>
+      <button id="btn-generate" class="primary">⚙ Generate</button>
+      <button id="btn-clear-layout">Clear</button>
       <span class="sep"></span>
-      <label class="toggle">
+      <button id="btn-seed" title="Load a sample room and inventory">🌱 Sample</button>
+      <span class="sep desktop-only"></span>
+      <label class="toggle desktop-only">
         <input type="checkbox" id="toggle-manual" />
-        <span>Manual edit mode</span>
+        <span>Manual</span>
       </label>
-      <span class="sep"></span>
-      <label class="toggle">
+      <label class="toggle desktop-only">
         <input type="checkbox" id="toggle-grid" checked />
         <span>Grid</span>
       </label>
-      <label class="toggle">
+      <label class="toggle desktop-only">
         <input type="checkbox" id="toggle-labels" checked />
         <span>Labels</span>
       </label>
     </div>
-    <div class="status" id="status">Ready.</div>
+    <div class="right-topbar">
+      <div class="status" id="status">Ready.</div>
+      <button class="tray-toggle" id="btn-tray-right" aria-label="Open tools panel">⋮</button>
+    </div>
   </header>
+  <div class="tray-backdrop" id="tray-backdrop"></div>
 
   <main class="layout">
     <!-- LEFT: Room shape editor -->
     <aside class="panel left">
       <section>
         <h2>Room</h2>
-        <div class="row">
+        <div class="row two">
           <label>Units
             <select id="units">
               <option value="in">inches</option>
@@ -51,20 +57,51 @@
               <option value="mm">mm</option>
             </select>
           </label>
+          <label>Mode
+            <select id="room-mode">
+              <option value="rect">Rectangle + regions</option>
+              <option value="polygon">Drawn outline</option>
+            </select>
+          </label>
         </div>
-        <div class="row two">
-          <label>Width <input id="room-w" type="number" min="1" step="0.125" value="144" /></label>
-          <label>Length <input id="room-l" type="number" min="1" step="0.125" value="192" /></label>
+
+        <div id="rect-controls">
+          <div class="row two">
+            <label>Width <input id="room-w" type="number" min="1" step="0.125" value="144" /></label>
+            <label>Length <input id="room-l" type="number" min="1" step="0.125" value="192" /></label>
+          </div>
+          <p class="hint">Width = horizontal, Length = vertical. Use Add/Subtract regions below for bump-outs and jut-ins.</p>
         </div>
-        <p class="hint">Width = horizontal, Length = vertical. Use Add/Subtract regions for bump-outs and jut-ins (closets, chimneys, islands, etc.).</p>
+
+        <div id="polygon-controls" class="hidden">
+          <div class="row two">
+            <label>Snap to
+              <select id="snap-step">
+                <option value="6">6"</option>
+                <option value="12" selected>12" (1')</option>
+                <option value="24">24" (2')</option>
+                <option value="1">1" (fine)</option>
+              </select>
+            </label>
+            <button id="btn-draw" class="primary">✏️ Draw outline</button>
+          </div>
+          <div class="row two">
+            <button id="btn-draw-undo" disabled>↶ Undo vertex</button>
+            <button id="btn-draw-cancel" disabled>✕ Cancel</button>
+          </div>
+          <div class="row">
+            <button id="btn-clear-polygon">Clear drawn outline</button>
+          </div>
+          <p class="hint" id="draw-hint">Switch to draw mode, then click to place corners on the grid. Lines auto-axis-align. Click the first point or double-click to close.</p>
+        </div>
       </section>
 
-      <section>
+      <section id="regions-section">
         <h2>Jut-ins & Bump-outs</h2>
         <div class="region-list" id="region-list"></div>
         <div class="row">
-          <button id="btn-add-sub" title="Remove a rectangular area from the room">＋ Jut-in (subtract)</button>
-          <button id="btn-add-add" title="Add a rectangular area to the room">＋ Bump-out (add)</button>
+          <button id="btn-add-sub" title="Remove a rectangular area from the room">＋ Jut-in</button>
+          <button id="btn-add-add" title="Add a rectangular area to the room">＋ Bump-out</button>
         </div>
         <p class="hint">Tip: origin (0,0) is the top-left corner of the base rectangle.</p>
       </section>
@@ -94,6 +131,15 @@
 
     <!-- RIGHT: Inventory, layout, profiles, export -->
     <aside class="panel right">
+      <section class="mobile-only">
+        <h2>View</h2>
+        <div class="row">
+          <label class="toggle"><input type="checkbox" id="toggle-manual-m" /><span>Manual edit</span></label>
+          <label class="toggle"><input type="checkbox" id="toggle-grid-m" checked /><span>Grid</span></label>
+          <label class="toggle"><input type="checkbox" id="toggle-labels-m" checked /><span>Labels</span></label>
+        </div>
+      </section>
+
       <section>
         <h2>Board inventory</h2>
         <div class="row">

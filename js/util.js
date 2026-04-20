@@ -125,13 +125,85 @@ export function stripIntervalsV(room, x1, x2) {
   return out;
 }
 
-// The list of additive rectangles: base + "add" regions.
+// The list of additive rectangles: base + "add" regions. In 'polygon' mode the
+// base rect is ignored and the room shape is entirely carried by the "add"
+// regions produced by polygonToRects().
 export function roomRects(room) {
-  const out = [{ x: 0, y: 0, w: room.width, h: room.length }];
+  const out = [];
+  if (room.mode !== 'polygon') {
+    out.push({ x: 0, y: 0, w: room.width, h: room.length });
+  }
   for (const r of (room.regions || [])) {
     if (r.type === 'add') out.push({ x: r.x, y: r.y, w: r.w, h: r.h });
   }
   return out;
+}
+
+// Decompose an orthogonal simple polygon into axis-aligned rectangles using
+// horizontal slab decomposition. Each slab is [y_i, y_{i+1}] between
+// consecutive distinct polygon y-coordinates; within a slab, the polygon
+// interior is a union of x-intervals determined by the crossing vertical edges.
+export function polygonToRects(poly) {
+  if (!poly || poly.length < 4) return [];
+  const ys = [...new Set(poly.map(p => p.y))].sort((a, b) => a - b);
+  const edges = polygonEdges(poly);
+  const rects = [];
+  for (let i = 0; i < ys.length - 1; i++) {
+    const y1 = ys[i], y2 = ys[i + 1];
+    const yMid = (y1 + y2) / 2;
+    // Collect vertical edges that span this slab.
+    const crossings = [];
+    for (const e of edges) {
+      if (e.horizontal) continue;
+      const yMin = Math.min(e.a.y, e.b.y);
+      const yMax = Math.max(e.a.y, e.b.y);
+      if (yMin <= y1 + 1e-9 && yMax >= y2 - 1e-9) crossings.push(e.a.x);
+    }
+    crossings.sort((a, b) => a - b);
+    for (let k = 0; k + 1 < crossings.length; k += 2) {
+      const x1 = crossings[k], x2 = crossings[k + 1];
+      if (x2 - x1 > 1e-6) rects.push({ x: x1, y: y1, w: x2 - x1, h: y2 - y1 });
+    }
+  }
+  return rects;
+}
+
+export function polygonEdges(poly) {
+  const out = [];
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i];
+    const b = poly[(i + 1) % poly.length];
+    out.push({ a, b, horizontal: Math.abs(a.y - b.y) < 1e-9 });
+  }
+  return out;
+}
+
+// Convert a polygon into the room's internal rect representation. Returns the
+// patched { width, length, regions } to drop into `state.room`.
+export function applyPolygonToRoom(poly) {
+  const rects = polygonToRects(poly);
+  const regions = rects.map((r, i) => ({
+    id: `poly_${i}`, type: 'add', x: r.x, y: r.y, w: r.w, h: r.h,
+  }));
+  return {
+    mode: 'polygon',
+    width: 0,
+    length: 0,
+    regions,
+    polygon: poly.map(p => ({ x: p.x, y: p.y })),
+  };
+}
+
+// Signed area of polygon; used to show if it is CW/CCW. Positive = CCW.
+export function polygonArea(poly) {
+  if (!poly || poly.length < 3) return 0;
+  let s = 0;
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i];
+    const b = poly[(i + 1) % poly.length];
+    s += a.x * b.y - b.x * a.y;
+  }
+  return s / 2;
 }
 
 // Point-in-room test (for manual drag bounds).
@@ -150,7 +222,11 @@ export function pointInRoom(room, x, y) {
 
 // Room bounding box that includes any add regions outside the base.
 export function roomBBox(room) {
-  let minX = 0, minY = 0, maxX = room.width, maxY = room.length;
+  const polygon = room.mode === 'polygon';
+  let minX = polygon ?  Infinity : 0;
+  let minY = polygon ?  Infinity : 0;
+  let maxX = polygon ? -Infinity : (room.width || 0);
+  let maxY = polygon ? -Infinity : (room.length || 0);
   for (const r of (room.regions || [])) {
     if (r.type === 'add') {
       minX = Math.min(minX, r.x);
@@ -159,6 +235,13 @@ export function roomBBox(room) {
       maxY = Math.max(maxY, r.y + r.h);
     }
   }
+  for (const p of (room.polygon || [])) {
+    minX = Math.min(minX, p.x);
+    minY = Math.min(minY, p.y);
+    maxX = Math.max(maxX, p.x);
+    maxY = Math.max(maxY, p.y);
+  }
+  if (minX === Infinity) return { x: 0, y: 0, w: 0, h: 0 };
   return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
 }
 

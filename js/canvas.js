@@ -1,7 +1,7 @@
 // SVG canvas rendering, pan/zoom, selection, and manual board dragging.
 
 import { state } from './state.js';
-import { roomBBox, roomRects, pointInRoom, formatLen } from './util.js';
+import { roomBBox, roomRects, pointInRoom, formatLen, polygonEdges } from './util.js';
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
@@ -11,17 +11,26 @@ let gGrid;
 let gRoom;
 let gBoards;
 let gOverlay;
+let gDraw;    // polygon-draw preview layer (in-progress outline)
 
 // callbacks registered from app.js
 let onSelect = () => {};
 let onMoveEnd = () => {};
 let onCursor = () => {};
+let onDrawComplete = () => {};
+let onDrawCancel = () => {};
+
+// Ephemeral draw-mode state (not undo-tracked).
+let draftPoly = [];          // committed vertices
+let draftCursor = null;      // snapped pointer position in room coords
 
 export function initCanvas(root, opts) {
   svg = root;
   onSelect = opts.onSelect || onSelect;
   onMoveEnd = opts.onMoveEnd || onMoveEnd;
   onCursor = opts.onCursor || onCursor;
+  onDrawComplete = opts.onDrawComplete || onDrawComplete;
+  onDrawCancel = opts.onDrawCancel || onDrawCancel;
 
   while (svg.firstChild) svg.removeChild(svg.firstChild);
 
@@ -30,7 +39,8 @@ export function initCanvas(root, opts) {
   gRoom = el('g', { id: 'room' });
   gBoards = el('g', { id: 'boards' });
   gOverlay = el('g', { id: 'overlay' });
-  gRoot.append(gGrid, gRoom, gBoards, gOverlay);
+  gDraw = el('g', { id: 'draw' });
+  gRoot.append(gGrid, gRoom, gBoards, gOverlay, gDraw);
   svg.append(gRoot);
 
   // Pan with middle mouse or shift+drag; zoom with wheel.
@@ -52,6 +62,21 @@ export function initCanvas(root, opts) {
       panning = true; lastX = e.clientX; lastY = e.clientY;
       svg.setPointerCapture(e.pointerId);
       svg.style.cursor = 'grabbing';
+      return;
+    }
+    if (state.view.drawing && e.button === 0) {
+      const pt = snapDrawPoint(clientToRoom(e.clientX, e.clientY));
+      // Close if clicking near the first vertex (with >=3 verts).
+      if (draftPoly.length >= 3 && near(pt, draftPoly[0])) {
+        finishDraft();
+        return;
+      }
+      // Enforce orthogonal constraint after the first vertex.
+      const prev = draftPoly[draftPoly.length - 1];
+      const next = prev ? orthogonalize(prev, pt) : pt;
+      draftPoly.push(next);
+      renderDraft();
+      e.preventDefault();
     }
   });
   svg.addEventListener('pointermove', (e) => {
@@ -66,6 +91,10 @@ export function initCanvas(root, opts) {
       state.view.pan.y += dy / scale;
       applyTransform();
     }
+    if (state.view.drawing) {
+      draftCursor = snapDrawPoint(pt);
+      renderDraft();
+    }
   });
   svg.addEventListener('pointerup', (e) => {
     if (panning) {
@@ -75,13 +104,173 @@ export function initCanvas(root, opts) {
     }
   });
   svg.addEventListener('pointerleave', () => onCursor(null));
+  svg.addEventListener('dblclick', (e) => {
+    if (state.view.drawing && draftPoly.length >= 3) {
+      finishDraft();
+      e.preventDefault();
+    }
+  });
 
   // Clicking on empty canvas clears selection.
   svg.addEventListener('click', (e) => {
+    if (state.view.drawing) return; // swallowed by pointerdown logic
     if (e.target === svg || e.target === gRoot || e.target.dataset?.type === 'room-fill') {
       onSelect(null);
     }
   });
+}
+
+// ---- Draw mode ----
+
+export function startDrawing() {
+  state.view.drawing = true;
+  draftPoly = [];
+  draftCursor = null;
+  svg.style.cursor = 'crosshair';
+  renderDraft();
+}
+
+export function cancelDrawing() {
+  state.view.drawing = false;
+  draftPoly = [];
+  draftCursor = null;
+  svg.style.cursor = '';
+  renderDraft();
+  onDrawCancel();
+}
+
+export function undoDrawPoint() {
+  if (!state.view.drawing) return;
+  draftPoly.pop();
+  renderDraft();
+}
+
+function finishDraft() {
+  if (draftPoly.length < 3) return;
+  // Close path orthogonally back to the first vertex.
+  const first = draftPoly[0];
+  const last = draftPoly[draftPoly.length - 1];
+  const poly = draftPoly.slice();
+  if (Math.abs(last.x - first.x) > 1e-6 && Math.abs(last.y - first.y) > 1e-6) {
+    // Need an L-shaped closure. Pick axis opposite to the last edge so we keep
+    // alternating axes.
+    const prev = poly[poly.length - 2] || first;
+    const lastHoriz = Math.abs(last.y - prev.y) < 1e-6;
+    poly.push(lastHoriz ? { x: last.x, y: first.y } : { x: first.x, y: last.y });
+  }
+  // Remove duplicate/collinear vertices.
+  const cleaned = dedupeCollinear(poly);
+  if (cleaned.length < 4) { cancelDrawing(); return; }
+  state.view.drawing = false;
+  draftPoly = [];
+  draftCursor = null;
+  svg.style.cursor = '';
+  renderDraft();
+  onDrawComplete(cleaned);
+}
+
+function snapDrawPoint(pt) {
+  const step = Math.max(state.view.snapStep || 1, 0.0625);
+  return { x: Math.round(pt.x / step) * step, y: Math.round(pt.y / step) * step };
+}
+
+function orthogonalize(prev, pt) {
+  const dx = Math.abs(pt.x - prev.x);
+  const dy = Math.abs(pt.y - prev.y);
+  if (dx >= dy) return { x: pt.x, y: prev.y }; // horizontal
+  return { x: prev.x, y: pt.y };               // vertical
+}
+
+function near(a, b) {
+  const tol = Math.max(state.view.snapStep || 1, 0.25) * 0.75;
+  return Math.abs(a.x - b.x) <= tol && Math.abs(a.y - b.y) <= tol;
+}
+
+function dedupeCollinear(poly) {
+  const out = [];
+  for (const p of poly) {
+    const last = out[out.length - 1];
+    if (!last || Math.abs(last.x - p.x) > 1e-6 || Math.abs(last.y - p.y) > 1e-6) out.push(p);
+  }
+  // Drop collinear middle vertices.
+  const r = [];
+  for (let i = 0; i < out.length; i++) {
+    const a = out[(i - 1 + out.length) % out.length];
+    const b = out[i];
+    const c = out[(i + 1) % out.length];
+    const abH = Math.abs(a.y - b.y) < 1e-6;
+    const bcH = Math.abs(b.y - c.y) < 1e-6;
+    if (abH && bcH) continue;
+    if (!abH && !bcH) continue;
+    r.push(b);
+  }
+  return r;
+}
+
+function renderDraft() {
+  while (gDraw.firstChild) gDraw.removeChild(gDraw.firstChild);
+  if (!state.view.drawing) return;
+  if (!draftPoly.length) return;
+
+  // Segments between committed vertices.
+  const pts = draftPoly.slice();
+  const preview = draftCursor && pts.length
+    ? orthogonalize(pts[pts.length - 1], draftCursor)
+    : null;
+  const all = preview ? [...pts, preview] : pts;
+
+  const polyPath = all.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x} ${p.y}`).join(' ');
+  gDraw.append(el('path', {
+    d: polyPath, fill: 'none', stroke: '#4ea1ff', 'stroke-width': 0.4,
+    'stroke-dasharray': preview ? '2 2' : '',
+  }));
+
+  // Vertex markers.
+  for (let i = 0; i < pts.length; i++) {
+    const p = pts[i];
+    gDraw.append(el('circle', {
+      cx: p.x, cy: p.y, r: i === 0 ? 1.2 : 0.8,
+      fill: i === 0 ? '#ffd36b' : '#4ea1ff',
+      stroke: '#0a0d12', 'stroke-width': 0.2,
+    }));
+  }
+  if (preview) {
+    gDraw.append(el('circle', {
+      cx: preview.x, cy: preview.y, r: 0.8,
+      fill: '#7dd3fc', stroke: '#0a0d12', 'stroke-width': 0.2,
+    }));
+    // Live dimension label on the in-progress edge.
+    const last = pts[pts.length - 1];
+    const len = Math.hypot(preview.x - last.x, preview.y - last.y);
+    if (len > 1e-6) {
+      gDraw.append(edgeLabel(last, preview, formatLen(len, state.units), '#7dd3fc'));
+    }
+  }
+
+  // Dimension labels on committed edges.
+  for (let i = 0; i + 1 < pts.length; i++) {
+    const a = pts[i], b = pts[i + 1];
+    const len = Math.hypot(b.x - a.x, b.y - a.y);
+    if (len > 1e-6) gDraw.append(edgeLabel(a, b, formatLen(len, state.units), '#c9e6ff'));
+  }
+}
+
+function edgeLabel(a, b, text, color) {
+  const mx = (a.x + b.x) / 2;
+  const my = (a.y + b.y) / 2;
+  const horizontal = Math.abs(a.y - b.y) < 1e-6;
+  const dx = horizontal ? 0 : 2;
+  const dy = horizontal ? -1.2 : 0;
+  const g = el('g', {});
+  g.append(el('text', {
+    x: mx + dx, y: my + dy,
+    'text-anchor': horizontal ? 'middle' : 'start',
+    'dominant-baseline': horizontal ? 'auto' : 'central',
+    fill: color, 'font-size': 2.2,
+    'font-family': 'system-ui, sans-serif',
+    'paint-order': 'stroke', stroke: '#0a0d12', 'stroke-width': 0.6,
+  }, [ document.createTextNode(text) ]));
+  return g;
 }
 
 function el(tag, attrs = {}, children = []) {
@@ -95,7 +284,12 @@ function el(tag, attrs = {}, children = []) {
 }
 
 function getDisplayMetrics() {
-  const bbox = roomBBox(state.room);
+  let bbox = roomBBox(state.room);
+  // Empty room (e.g. polygon mode with no outline yet, or before drawing):
+  // fall back to a default canvas so the grid and cursor have a useful scale.
+  if (bbox.w < 1 || bbox.h < 1) {
+    bbox = { x: 0, y: 0, w: 240, h: 240 };
+  }
   const rect = svg.getBoundingClientRect();
   const pad = 40;
   const scale = Math.min(
@@ -141,6 +335,7 @@ export function render() {
   renderRoom();
   renderBoards();
   renderOverlay();
+  renderDraft();
 }
 
 function renderGrid() {
@@ -177,15 +372,18 @@ function gridStep(units) {
 function renderRoom() {
   while (gRoom.firstChild) gRoom.removeChild(gRoom.firstChild);
 
-  // Draw additive shape (base + add) as filled polygons, then punch holes
-  // for subtractive regions.
+  // Fill rectangles (base + add) make the floor. In polygon mode, the base is
+  // degenerate and the add-rects produced from the polygon paint the shape.
   for (const r of roomRects(state.room)) {
+    if (r.w <= 0 || r.h <= 0) continue;
     gRoom.append(el('rect', {
       x: r.x, y: r.y, width: r.w, height: r.h,
-      fill: '#2a3442', stroke: '#4e6782', 'stroke-width': 0.4,
+      fill: '#2a3442', stroke: 'none',
       'data-type': 'room-fill',
     }));
   }
+
+  // Subtractive jut-ins punch holes.
   for (const r of (state.room.regions || [])) {
     if (r.type !== 'sub') continue;
     gRoom.append(el('rect', {
@@ -193,28 +391,46 @@ function renderRoom() {
       fill: '#0a0d12', stroke: '#e5a23b', 'stroke-width': 0.5,
       'stroke-dasharray': '2 2',
     }));
-    const tx = r.x + r.w / 2;
-    const ty = r.y + r.h / 2;
     gRoom.append(el('text', {
-      x: tx, y: ty, fill: '#e5a23b', 'font-size': Math.min(r.w, r.h) * 0.2,
-      'text-anchor': 'middle', 'dominant-baseline': 'central', 'font-family': 'system-ui, sans-serif',
+      x: r.x + r.w / 2, y: r.y + r.h / 2,
+      fill: '#e5a23b', 'font-size': Math.min(r.w, r.h) * 0.2,
+      'text-anchor': 'middle', 'dominant-baseline': 'central',
+      'font-family': 'system-ui, sans-serif',
       'paint-order': 'stroke', stroke: '#0a0d12', 'stroke-width': 0.5,
     }, [ document.createTextNode('JUT-IN') ]));
   }
 
-  // Dimension labels on the outline.
-  const bbox = roomBBox(state.room);
-  gRoom.append(el('text', {
-    x: bbox.x + bbox.w / 2, y: bbox.y - 4,
-    fill: '#8b97a8', 'font-size': 4, 'text-anchor': 'middle',
-    'font-family': 'system-ui, sans-serif',
-  }, [ document.createTextNode(formatLen(bbox.w, state.units)) ]));
-  gRoom.append(el('text', {
-    x: bbox.x - 4, y: bbox.y + bbox.h / 2,
-    fill: '#8b97a8', 'font-size': 4, 'text-anchor': 'end', 'dominant-baseline': 'central',
-    transform: `rotate(-90 ${bbox.x - 4} ${bbox.y + bbox.h / 2})`,
-    'font-family': 'system-ui, sans-serif',
-  }, [ document.createTextNode(formatLen(bbox.h, state.units)) ]));
+  // Outline: either the rectangle(s) outline, or — in polygon mode — the
+  // saved polygon.
+  if (state.room.mode === 'polygon' && state.room.polygon?.length >= 3) {
+    const d = state.room.polygon
+      .map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x} ${p.y}`).join(' ') + ' Z';
+    gRoom.append(el('path', {
+      d, fill: 'none', stroke: '#4e6782', 'stroke-width': 0.5,
+    }));
+    // Edge dimension labels.
+    for (const e of polygonEdges(state.room.polygon)) {
+      const len = Math.hypot(e.b.x - e.a.x, e.b.y - e.a.y);
+      if (len > 1e-6) gRoom.append(edgeLabel(e.a, e.b, formatLen(len, state.units), '#8b97a8'));
+    }
+  } else {
+    const bbox = roomBBox(state.room);
+    gRoom.append(el('rect', {
+      x: bbox.x, y: bbox.y, width: bbox.w, height: bbox.h,
+      fill: 'none', stroke: '#4e6782', 'stroke-width': 0.4,
+    }));
+    gRoom.append(el('text', {
+      x: bbox.x + bbox.w / 2, y: bbox.y - 4,
+      fill: '#8b97a8', 'font-size': 4, 'text-anchor': 'middle',
+      'font-family': 'system-ui, sans-serif',
+    }, [ document.createTextNode(formatLen(bbox.w, state.units)) ]));
+    gRoom.append(el('text', {
+      x: bbox.x - 4, y: bbox.y + bbox.h / 2,
+      fill: '#8b97a8', 'font-size': 4, 'text-anchor': 'end', 'dominant-baseline': 'central',
+      transform: `rotate(-90 ${bbox.x - 4} ${bbox.y + bbox.h / 2})`,
+      'font-family': 'system-ui, sans-serif',
+    }, [ document.createTextNode(formatLen(bbox.h, state.units)) ]));
+  }
 }
 
 function renderBoards() {

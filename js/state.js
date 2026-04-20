@@ -4,9 +4,11 @@ import { uid } from './util.js';
 export const state = {
   units: 'in',
   room: {
+    mode: 'rect',        // 'rect' | 'polygon'
     width: 144,
     length: 192,
-    regions: [], // [{id, type: 'sub'|'add', x, y, w, h}]
+    regions: [],         // [{id, type: 'sub'|'add', x, y, w, h}]
+    polygon: [],         // [{x,y}] closed orthogonal polygon (CW or CCW), first != last
   },
   inventory: [], // [{id, name, width, length, qty}]
   layout: {
@@ -23,6 +25,9 @@ export const state = {
     showGrid: true,
     showLabels: true,
     manualMode: false,
+    drawing: false,              // currently drawing a polygon
+    drawBuffer: [],              // in-progress polygon vertices
+    snapStep: 12,                // inches; grid-snap step for drawing
     zoom: 1,
     pan: { x: 0, y: 0 },
   },

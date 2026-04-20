@@ -4,10 +4,11 @@
 import { state, pushHistory, undo, redo, addRegion, removeRegion,
          addInventory, removeInventory, clearLayout } from './state.js';
 import { generateLayout } from './layout.js';
-import { initCanvas, render, fitView, zoomBy, toSVGString, toPNGBlob } from './canvas.js';
+import { initCanvas, render, fitView, zoomBy, toSVGString, toPNGBlob,
+         startDrawing, cancelDrawing, undoDrawPoint } from './canvas.js';
 import { parseCSV, toCSV, rowsToInventory } from './csv.js';
 import { saveProfile, deleteProfile, getProfile, listProfiles } from './storage.js';
-import { UNITS, formatLen, roomArea, roomBBox, download } from './util.js';
+import { UNITS, formatLen, roomArea, roomBBox, download, applyPolygonToRoom } from './util.js';
 
 // ---------- Init ----------
 
@@ -23,6 +24,8 @@ initCanvas(svg, {
       ? `x: ${formatLen(pt.x, state.units)}  y: ${formatLen(pt.y, state.units)}`
       : '—';
   },
+  onDrawComplete: (poly) => { finishPolygonDraw(poly); },
+  onDrawCancel: () => { setDrawUI(false); flashStatus('Drawing cancelled.'); },
 });
 
 seedDefaults();
@@ -42,6 +45,49 @@ function seedDefaults() {
   if (!state.layout.rowWidth) state.layout.rowWidth = 5;
 }
 
+// Populate room + inventory with a realistic test profile. Uses inches
+// internally; a 14' × 18' room with a 3'×2' closet jut-in and a 2'×4'
+// chimney, plus a CSV-style varied-length 5" plank inventory.
+function loadSampleData() {
+  state.units = 'ft';
+  state.room = {
+    mode: 'rect',
+    width: 14 * 12,
+    length: 18 * 12,
+    polygon: [],
+    regions: [
+      { id: 'reg_s1', type: 'sub', x: 0, y: 0, w: 3 * 12, h: 2 * 12 },
+      { id: 'reg_s2', type: 'sub', x: 14 * 12 - 2 * 12, y: 10 * 12, w: 2 * 12, h: 4 * 12 },
+    ],
+  };
+  state.inventory = [];
+  const sample = [
+    ['A', 48.5, 8], ['B', 47.25, 6], ['C', 42, 5], ['D', 38.75, 6],
+    ['E', 36, 8], ['F', 30, 6], ['G', 27.5, 4], ['H', 24, 6],
+    ['I', 22, 4], ['J', 18.5, 4],
+  ];
+  for (const [name, length, qty] of sample) {
+    addInventory({ name, width: 5, length, qty });
+  }
+  state.layout = {
+    ...state.layout,
+    pattern: 'running',
+    orientation: 'horizontal',
+    rowWidth: 5,
+    minCut: 6,
+    stagger: 16,
+    seed: 7,
+    reuseCutoffs: true,
+    boards: [],
+  };
+  state.selection = null;
+  pushHistory();
+  renderAll();
+  // Auto-generate so the user sees a finished sample immediately.
+  $('#btn-generate').click();
+  fitView();
+}
+
 // ---------- Top-level render ----------
 
 function renderAll() {
@@ -58,8 +104,10 @@ function renderAll() {
 
 function syncInputs() {
   $('#units').value = state.units;
-  $('#room-w').value = displayVal(state.room.width);
-  $('#room-l').value = displayVal(state.room.length);
+  $('#room-mode').value = state.room.mode || 'rect';
+  $('#room-w').value = displayVal(state.room.width || 0);
+  $('#room-l').value = displayVal(state.room.length || 0);
+  $('#snap-step').value = String(state.view.snapStep);
   $('#pattern').value = state.layout.pattern;
   $('#orientation').value = state.layout.orientation;
   $('#min-cut').value = displayVal(state.layout.minCut);
@@ -69,6 +117,17 @@ function syncInputs() {
   $('#toggle-grid').checked = state.view.showGrid;
   $('#toggle-labels').checked = state.view.showLabels;
   $('#toggle-manual').checked = state.view.manualMode;
+  $('#toggle-grid-m').checked = state.view.showGrid;
+  $('#toggle-labels-m').checked = state.view.showLabels;
+  $('#toggle-manual-m').checked = state.view.manualMode;
+  syncModeUI();
+}
+
+function syncModeUI() {
+  const mode = state.room.mode || 'rect';
+  $('#rect-controls').classList.toggle('hidden', mode !== 'rect');
+  $('#polygon-controls').classList.toggle('hidden', mode !== 'polygon');
+  $('#regions-section').classList.toggle('hidden', mode === 'polygon');
 }
 
 // Internal values are inches. Display in chosen unit for user fields.
@@ -100,6 +159,109 @@ $('#units').addEventListener('change', (e) => {
     updateStats();
     render();
   });
+});
+
+// --- Room mode (rectangle vs drawn polygon) ---
+
+$('#room-mode').addEventListener('change', (e) => {
+  const mode = e.target.value;
+  if (mode === 'rect') {
+    // Drop the polygon representation and restore a rectangle with the bbox
+    // size so the user isn't left with an empty room.
+    if (state.room.mode === 'polygon') {
+      const bbox = roomBBox(state.room);
+      state.room.mode = 'rect';
+      state.room.width = bbox.w || 144;
+      state.room.length = bbox.h || 192;
+      state.room.regions = [];
+      state.room.polygon = [];
+    }
+  } else {
+    // Switching to polygon mode without a drawn outline yet.
+    if (!state.room.polygon?.length) {
+      state.room.mode = 'polygon';
+      state.room.width = 0;
+      state.room.length = 0;
+      state.room.regions = [];
+      state.room.polygon = [];
+    } else {
+      state.room.mode = 'polygon';
+    }
+  }
+  pushHistory();
+  syncInputs();
+  renderRegions();
+  updateStats();
+  fitView();
+  render();
+});
+
+// --- Polygon drawing controls ---
+
+$('#snap-step').addEventListener('change', (e) => {
+  state.view.snapStep = Number(e.target.value) || 12;
+});
+$('#btn-draw').addEventListener('click', () => {
+  const hadContent = state.room.mode !== 'polygon'
+    || (state.room.polygon?.length || 0) >= 3;
+  if (hadContent && !confirm('Start drawing a new outline? The current room shape will be replaced on finish.')) {
+    return;
+  }
+  state.room.mode = 'polygon';
+  state.room.width = 0;
+  state.room.length = 0;
+  state.room.regions = [];
+  state.room.polygon = [];
+  syncInputs();
+  setDrawUI(true);
+  pushHistory();
+  fitView();
+  render();
+  startDrawing();
+  flashStatus('Click to place corners. Click the first corner (or double-click) to close. Esc to cancel.');
+});
+$('#btn-draw-undo').addEventListener('click', () => { undoDrawPoint(); });
+$('#btn-draw-cancel').addEventListener('click', () => { cancelDrawing(); setDrawUI(false); });
+$('#btn-clear-polygon').addEventListener('click', () => {
+  if (!state.room.polygon?.length) return;
+  if (!confirm('Clear the drawn outline?')) return;
+  state.room.polygon = [];
+  state.room.regions = [];
+  state.room.width = 0;
+  state.room.length = 0;
+  pushHistory();
+  updateStats();
+  render();
+});
+
+function setDrawUI(on) {
+  $('#btn-draw').disabled = on;
+  $('#btn-draw-undo').disabled = !on;
+  $('#btn-draw-cancel').disabled = !on;
+  svg.classList.toggle('drawing', on);
+}
+
+function finishPolygonDraw(poly) {
+  const patched = applyPolygonToRoom(poly);
+  Object.assign(state.room, patched);
+  setDrawUI(false);
+  pushHistory();
+  syncInputs();
+  renderRegions();
+  updateStats();
+  fitView();
+  render();
+  flashStatus(`Outline: ${poly.length} corners, ${state.room.regions.length} slab rect(s).`);
+}
+
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && state.view.drawing) {
+    cancelDrawing(); setDrawUI(false);
+  } else if (e.key === 'Enter' && state.view.drawing) {
+    // Accept current draft — handled by pointer close; we dispatch a dblclick
+    // over the first point instead to keep logic in one place.
+    // No-op: users close by clicking the first vertex or double-clicking.
+  }
 });
 
 $('#btn-add-sub').addEventListener('click', () => { addRegion('sub'); pushHistory(); renderRegions(); updateStats(); render(); });
@@ -239,9 +401,49 @@ $('#btn-generate').addEventListener('click', () => {
 $('#btn-clear-layout').addEventListener('click', () => {
   clearLayout(); pushHistory(); renderInventory(); updateStats(); render();
 });
-$('#toggle-manual').addEventListener('change', (e) => { state.view.manualMode = e.target.checked; render(); });
-$('#toggle-grid').addEventListener('change', (e) => { state.view.showGrid = e.target.checked; render(); });
-$('#toggle-labels').addEventListener('change', (e) => { state.view.showLabels = e.target.checked; render(); });
+function bindViewToggle(ids, key) {
+  const [a, b] = ids;
+  const apply = (val) => {
+    state.view[key] = val;
+    $(a).checked = val;
+    $(b).checked = val;
+    render();
+  };
+  $(a).addEventListener('change', (e) => apply(e.target.checked));
+  $(b).addEventListener('change', (e) => apply(e.target.checked));
+}
+bindViewToggle(['#toggle-manual', '#toggle-manual-m'], 'manualMode');
+bindViewToggle(['#toggle-grid',   '#toggle-grid-m'],   'showGrid');
+bindViewToggle(['#toggle-labels', '#toggle-labels-m'], 'showLabels');
+
+// --- Seed sample data ---
+$('#btn-seed').addEventListener('click', () => {
+  loadSampleData();
+  flashStatus('Loaded sample room and inventory.');
+});
+
+// --- Mobile tray toggles ---
+
+const panelLeft = document.querySelector('.panel.left');
+const panelRight = document.querySelector('.panel.right');
+const backdrop = $('#tray-backdrop');
+function closeTrays() {
+  panelLeft.classList.remove('open');
+  panelRight.classList.remove('open');
+  backdrop.classList.remove('open');
+}
+function openTray(which) {
+  closeTrays();
+  (which === 'left' ? panelLeft : panelRight).classList.add('open');
+  backdrop.classList.add('open');
+}
+$('#btn-tray-left').addEventListener('click', () => openTray('left'));
+$('#btn-tray-right').addEventListener('click', () => openTray('right'));
+backdrop.addEventListener('click', closeTrays);
+window.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeTrays(); });
+// If viewport grows past the mobile breakpoint, make sure trays don't stay
+// stuck off-screen behind their transform rules.
+window.addEventListener('resize', closeTrays);
 $('#btn-zoom-in').addEventListener('click', () => zoomBy(1.25));
 $('#btn-zoom-out').addEventListener('click', () => zoomBy(0.8));
 $('#btn-zoom-reset').addEventListener('click', () => fitView());
